@@ -1,0 +1,279 @@
+import 'macros' as {$}
+_G.PROJECTNAME, _G.VERSION = $FILE\sub(1,-5), "0.1a(#{$DATE})"
+import 'lib.lume'
+import 'utl' as :pos_in_box, :align, :play, :L
+import 'lib.maid64' -- 改造して高解像度を初期値にした
+-- import 'color' as :sweetie16
+-- luacheck: ignore gifcat
+import 'lib.gifcat' -- gifcat.luaもprojectrootに置く? 全部に?入れているので、ここ消すだけで使わなくなる
+import 'input' as :input, :SoftGamepad -- これもuiの前に書く必要がある？
+import 'ui' as :Scene, :SelectBox, :Overlay, :Watchdog--, :BGM
+import 'bigmap' as :Map
+-- import 'lib.tween'  -- 改造してdelayを可能にした
+-- local * -- ^
+π = math.pi
+㍍ = 64 -- 世界において１メートル当たりの高さは 64 ピクセルです
+
+love.window.setTitle(PROJECTNAME .. ' - v' .. VERSION)
+love.window.setMode(910--[[800]], 512, if 'Android' == love.system.getOS() then {} else {resizable: true})
+maid64.setup(910, 512)--(1280, 720)
+love.mouse.getPosition = maid64.mouse.getPosition -- プログラム全体としてmaid64の座標系を使うことにする
+love.touch.getPosition0 or= love.touch.getPosition -- 保存
+love.touch.getPosition = (id)-> maid64.transformPosition(love.touch.getPosition0(id))
+love.audio.setVolume(.3)
+-- BGM'assets/sounds/052622ineedtogetouttahere_32k.mp3'
+love.physics.setMeter(1.0*㍍)
+hiscore = 0
+
+
+Fruit = with t = $orderedkeys{
+	さくらんぼ:  {radius: 13, density: 112*0.5}
+	苺: {radius: 17, density: 95*0.5}
+	葡萄: {radius: 25, density: 76*0.5}
+	デコポン: {radius: 29, density: 68*0.5}
+	柿: {radius: 37, density: 55*0.5}
+	林檎: {radius: 49, density: 49*0.5}
+	梨: {radius: 55, density: 37*0.5}
+	桃: {radius: 68, density: 29*0.5}
+	パイナップル: {radius: 76, density: 36*0.5}
+	メロン: {radius: 95, density: 17*0.5}
+	スイカ: {radius: 112, density: 13*0.5} -- 得点はindex*(index+1)/2。例)もしスイカ同士が消えたら11番目なので11*12/2=66点
+	} --|> setmetatable({_orderedkeys: {'さくらんぼ', '苺', '葡萄', 'デコポン', '柿', '林檎', '梨', '桃', 'パイナップル', 'メロン', 'スイカ'}})
+	.<>.orderedvalues = [t[k] for k in *.<>._orderedkeys]
+
+
+Sprites = with Map('assets/suika.png', {256, 256}) -- タイル状に並べるわけではないが、それなりに使えるのでつかう
+	.quads = lume.merge(.quads, {fruit, .quads[i] for i, fruit in ipairs Fruit.<>.orderedvalues}) -- fruitでアクセスするためのキーをつける
+-- image1 = gr.newFlyweightImage('assets/suika.png')
+-- quads = {Fruit[f], gr.newQuad((i-1)%4*256, idiv(i-1,4)*256,256,256,1024,1024) for i, f in ipairs Fruit.<>._orderedkeys}
+
+
+class Game extends Scene
+	@BOX = {(maid64.sizeX-385)/2, 55, 385, 435}
+	new: =>
+		@softgamepad = SoftGamepad({Left: {65, 370, 60, '←'}, Right: {195, 370, 60, '→'}, A: {760, 390, 60, '落とす'}}, gr.newFlyweightFont($FONT1, 30))
+		@load('last')
+		-- @@Bubble(0,0)
+		@autosavetimer = 0
+
+	newgame: =>
+		@time = 0
+		@x = @@BOX[1]+@@BOX[3]/2
+		@world = with love.physics.newWorld(0, 9.81*㍍, true) -- 水平重力は 0、垂直重力は  9.81 の物体が存在するワールドを作成します。
+			\setCallbacks((a,b,coll)->@beginContact(a,b,coll))--, @endContact, @preSolve, @postSolve) -- 関数を渡すがselfは使いたいので包む
+		do --floor
+			body = love.physics.newBody(@world, maid64.sizeX/2, @@BOX[2]+@@BOX[4]+50/2) -- 中心
+			shape = love.physics.newRectangleShape(910, 50)
+			love.physics.newFixture(body, shape)\setUserData('Floor')
+		do -- left wall
+			body = love.physics.newBody(@world, @@BOX[1]-50/2, maid64.sizeY/2)
+			shape = love.physics.newRectangleShape(50, maid64.sizeY)
+			love.physics.newFixture(body, shape)
+		do --right wall
+			body = love.physics.newBody(@world, @@BOX[1]+@@BOX[3]+50/2, maid64.sizeY/2)
+			shape = love.physics.newRectangleShape(50, maid64.sizeY)
+			love.physics.newFixture(body, shape)
+		@objects, @score = {}, 0
+		@current, @next = @getNext(), @getNext()
+		play'assets/sounds/効果音ラボ/ニュースタイトル表示1.mp3'
+		@tasks = {}
+
+	save: (slot = 'last')=>
+		-- if 'Web' == love.system.getOS() then return
+		savedata = if love.filesystem.getInfo(PROJECTNAME..'.save') then lume.deserialize(love.filesystem.read(PROJECTNAME..'.save') or '{}') else {}
+		savedata.hiscore = hiscore
+		getinfo = (object)->
+			x, y = object.body\getPosition()
+			fruit = Fruit.<>._orderedkeys[lume.find(Fruit.<>.orderedvalues, object.fixture\getUserData())]
+			{x: x, y: y, fruit: fruit}
+		savedata[slot] = lume.merge({score: @score}, [getinfo(o) for o in *@objects])
+		love.filesystem.write(PROJECTNAME..'.save', lume.serialize(savedata))
+
+	load: (slot)=>
+		@newgame()
+		-- if 'Web' == love.system.getOS() then return
+		savedata = if love.filesystem.getInfo(PROJECTNAME..'.save') then lume.deserialize(love.filesystem.read(PROJECTNAME..'.save') or '{}') else {}
+		hiscore = savedata.hiscore or 0
+		if savedata[slot]
+			@score = savedata[slot].score or 0
+			@spawn(o.x, o.y, Fruit[o.fruit]) for o in *savedata[slot]
+
+	-- undo: =>
+
+	quit: => @save() -- autosave
+	focus: (f)=> if not f then @save()  -- androidではquitイベントが来ない？ため
+
+	filedropped: (file)=>
+		savedata = lume.deserialize(file\read() or '{}')
+		if savedata['slot1']
+			@score = savedata['slot1'].score or 0
+			@spawn(o.x, o.y, Fruit[o.fruit]) for o in *savedata['slot1']
+
+
+	isgameover: => lume.any(@objects, (o)->rawget({o.body\getPosition()}, 2)-o.fixture\getUserData().radius < @@BOX[2] - 50) --葡萄の直径くらいはみ出るとゲームオーバー
+
+	getNext: =>
+		@static_candidates or= lume.first(Fruit.<>.orderedvalues, 5) |> lume.shuffle
+		lume.randomchoice(@static_candidates)
+
+	spawn: (x, y, fruit)=>
+		if not fruit then return
+		-- pp x, y
+		@objects[] = with ball = {}
+			.body = love.physics.newBody(@world, x, y, "dynamic")
+			.shape = love.physics.newCircleShape(fruit.radius)
+			.fixture = with love.physics.newFixture(.body, .shape, fruit.density/10^2/200) -- 物体に取付具を接続して密度を指定します。
+				\setFriction(.02) -- 摩擦係数
+				\setRestitution(.2)--(0.9) -- 玉を弾ませます
+				\setUserData(fruit)
+		-- lume.last(@object).body\setLinearVelocity(32, 32)
+
+	update: (dt)=>
+		@time += dt
+		@autosavetimer += dt
+		if @autosavetimer > 60 then _, @autosavetimer = @save(), 0
+		table.remove(@tasks, 1)?()
+		if not @lock and @isgameover() then return @@Result()\attach()
+		@world\update(dt)
+		mx, my = love.mouse.getPosition()
+		if input.Left() then @x -= math.min(input.counters.Left/3, 5)
+		if input.Right() then @x += math.min(input.counters.Right/3, 5)
+		@x += @softgamepad\leftx() * 5
+		if input.MLB() and pos_in_box({mx, my}, align.enlarge(@@BOX, 0, 40)) then @x = (love.mouse.getPosition())
+		@x = lume.clamp(@x, @@BOX[1]+9, @@BOX[1]+@@BOX[3]-9) -- 少し狭まっている
+		if input.counters.MLB > 100 and not pos_in_box({mx, my}, align.enlarge(@@BOX, 0, 40)) and input.counters.Left+input.counters.Right+input.counters.A == 0 then @@PauseMenu()\attach()
+		if not @lock and (input.Ap() or (pos_in_box({love.mouse.getPosition()}, align.enlarge(@@BOX, 0, 40)) and input.MLBr()))
+			@spawn(@x, @@BOX[2], @current)
+			play'assets/sounds/効果音ラボ/カーソル移動3.mp3'
+			@current, @next, @lock = @next, @getNext(), lume.last(@objects).fixture -- 手を離してからなにかにぶつかるまでは操作できない
+
+	beginContact: (a, b, coll)=>
+		data1, data2 = a\getUserData(), b\getUserData()
+		-- pp 'beginContact', data1, data2, coll\getPositions()
+		-- print a, b, Fruit.<>._orderedkeys[lume.find(Fruit.<>.orderedvalues, data1)], Fruit.<>._orderedkeys[lume.find(Fruit.<>.orderedvalues, data2)]
+		if data1 and data2
+			if data1 == data2 and 0 == #@tasks -- 一つずつ処理する？
+				x1, y1, _, _ = coll\getPositions()
+				a\getBody()\destroy()
+				b\getBody()\destroy()
+				n = lume.find(Fruit.<>.orderedvalues, data1)
+				-- if Fruit.<>.orderedvalues[n+1] then
+				@tasks[] = -> @spawn(x1, y1, Fruit.<>.orderedvalues[n+1]) -- 壊した直後に追加はできないようだ。次のupdateに溜めておく スイカどうしで消える
+				@@.Bubble(x1, y1)
+				@score += n*(n+1)/2--next.score
+				hiscore = if @score > hiscore then @score else hiscore
+				play'assets/sounds/効果音ラボ/パパッ.mp3'
+			if @lock == a or @lock == b then @lock = nil
+
+	-- endContact: (a, b, coll)=>
+	-- 	-- pp 'endContact', a, b, coll
+    --
+	-- preSolve: (a, b, coll)=>
+	-- 	-- pp 'preSolve'
+	-- 	-- if a and b and coll
+	-- 	-- 	print "preSolve"
+    --
+	-- postSolve: (a, b, coll, normalimpulse, tangentimpulse)=>
+
+	draw: =>
+		gr.clear(gr.uipalette.base)
+		dy = math.sin(@time*2)*7 -- ゆらゆらさせる
+		gr.circle(gr.setColor(gr.uipalette.base2) or 'fill', 110, 100+dy, 80)
+		gr.circle('fill', 800, 100+dy, 80)
+		gr.circle('fill', 800, 260, 80)
+		Sprites.spritebatch\clear()
+		gr.print(gr.setFont(gr.newFlyweightFont($FONT1)) or gr.setColor(gr.uipalette.text) or (L'Score'..'\n % 4d\n'..L'HiScore'..'\n % d\n'..L'Time'..'\n% 4d:%02d')\format(@score, hiscore, @time/60, @time%60), 60, 20+dy)
+		gr.print(L'Next', 770, 30+dy)
+		-- gr.setColor(1,1,1,1)
+		for i, fruit in ipairs Fruit.<>.orderedvalues
+			x, y = lume.rotate(0, -60, (i-0.7)*6/11)
+			-- gr.circle(gr.setColor(fruit.color) or 'fill', 800+x, 260+y, 12)--800+i*10, 260, 10)
+			Sprites.spritebatch\add(Sprites.quads[fruit], 800+x, 260+y, 0, 12/102.5, 12/102.5, 127, 127)
+		if nil == @lock
+			gr.line(gr.setColor(gr.uipalette.text) or gr.setLineWidth(1) or @x, @@BOX[2]-30, @x, @@BOX[2]+@@BOX[4])
+			-- gr.circle(gr.setColor(@current.color) or 'fill', @x, @@BOX[2]-30, @current.radius)
+			Sprites.spritebatch\add(Sprites.quads[@current], @x, @@BOX[2]-30, 0-π/4, @current.radius/102.5, @current.radius/102.5, 127, 127)
+			-- gr.circle(gr.setColor(@next.color) or 'fill', 800, 100+dy, @next.radius)
+			Sprites.spritebatch\add(Sprites.quads[@next], 800, 100+dy, 0, @next.radius/102.5, @next.radius/102.5, 127, 127)
+		else
+			-- gr.circle(gr.setColor(@current.color) or 'fill', 800, 100+dy, @current.radius)
+			Sprites.spritebatch\add(Sprites.quads[@current], 800, 100+dy, 0, @current.radius/102.5, @current.radius/102.5, 127, 127)
+		@objects = [it for it in *@objects when not it.body\isDestroyed()] -- フラグのついたオブジェクトを削除
+		for it in *@objects
+			x, y, r, a = it.body\getX(), it.body\getY(), it.shape\getRadius(), it.body\getAngle()
+			fruit = it.fixture\getUserData()
+			-- gr.circle(gr.setColor(fruit.color) or 'fill', x, y, r)
+			-- gr.line(gr.setColor(gr.uipalette.text) or it.body\getX(), it.body\getY(), it.body\getX()+math.cos(a)*r, it.body\getY()+math.sin(a)*r)
+			Sprites.spritebatch\add(Sprites.quads[fruit], x, y, a-π/4, r/102.5, r/102.5, 127, 127)
+		_ = [Sprites.spritebatch\add(Sprites.quads[16], x, y, 0, time * 1, time * 1, 127, 127) for {x: x, y: y, time: time} in *Scene.overlays when x and y and time]
+		for {x: x, y: y, time: time} in *Scene.overlays do if x and y and time then Sprites.spritebatch\add(Sprites.quads[16], x, y, 0, time * 1, time * 1, 127, 127)
+		Sprites\draw()
+		gr.rectangle(gr.setColor(gr.uipalette.base2) or gr.setLineWidth(4) or 'line', @@BOX[1]-4, @@BOX[2]-4, @@BOX[3]+8, @@BOX[4]+8, 10, 10)
+		gr.polygon(gr.setColor(gr.uipalette.red) or 'fill', @x,@@BOX[2]-40,  @x-20,@@BOX[2]-60, @x+20,@@BOX[2]-60)
+		@softgamepad\draw()
+
+
+	class @Bubble extends Overlay
+		new: (@x, @y)=>
+			-- print @__class.__name
+			@time = 0
+			-- print @x, @y, @time
+			super()
+		_update: (dt)=>
+			while @time < 0.3
+				@time += dt
+				coroutine.yield()
+		-- draw: =>
+		-- 	Sprites.spritebatch\add(Sprites.quads[16], @x, @y, 0, @time * 50, @time *50, 127, 127)
+
+	class @PauseMenu extends SelectBox
+		new: =>
+			super(SelectBox.buildButtons({L'Close', L'NewGame', L'Save'..' '..L'Slot'..1, L'Load'..' '..L'Slot'..1}, [{340,120+80*(i-1),300,70} for i=1,4], { (-> @detach()), (-> @detach(@parent\newgame())), (->@detach(@parent\save('slot1'))), (->@detach(@parent\load('slot1'))) } ))
+		draw: =>
+			gr.roundrect10(gr.setColor({...gr.uipalette.text,[4]:.6}) or 'fill', 300, 60, 380, 400)
+			gr.setFont(gr.newFlyweightFont($FONT1))
+			gr.print(gr.setColor(gr.uipalette.base) or L'Pause'..L'Menu', 400, 80)
+			for id=1, #@buttons
+				gr.roundrect10(gr.setColor(if id == @index then gr.uipalette.selected else gr.uipalette.base2) or 'fill', unpack @buttons[id].box)
+				gr.print_center(gr.setColor(gr.uipalette.text) or @buttons[id].text, @buttons[id].box)
+
+	class @Result extends SelectBox
+		new: =>
+			super(SelectBox.buildButtons({L'NewGame'}, [{340,50+120*(i),300,80} for i=1,1], { (-> @detach(@parent\newgame())) }))
+			play'assets/sounds/効果音ラボ/間抜け4.mp3'
+		draw: =>
+			gr.roundrect10(gr.setColor({...gr.uipalette.text,[4]:.6}) or 'fill', 300, 40, 380, 360)
+			gr.setFont(gr.newFlyweightFont($FONT1))
+			gr.print(gr.setColor(gr.uipalette.base) or L'GameOver', 400, 80)
+			for id=1, #@buttons
+				gr.roundrect10(gr.setColor(if id == @index then gr.uipalette.selected else gr.uipalette.base2) or 'fill', unpack @buttons[id].box)
+				gr.print_center(gr.setColor(gr.uipalette.text) or @buttons[id].text, @buttons[id].box)
+
+
+love.load = ->
+	Game()\attach()
+
+	if DEBUGMODE -- hotswap
+		Watchdog{
+			"#{$FILE}": -> Watchdog.transpile("#{$FILE}", 'main.lua')
+			'ui.yue': -> Watchdog.transpile('ui.yue')
+			'input.yue': -> Watchdog.transpile('input.yue')
+			-- 'color.yue': -> Watchdog.transpile('color.yue')
+			'utl.yue': -> Watchdog.transpile('utl.yue')
+			'bigmap.yue': -> Watchdog.transpile('bigmap.yue')
+			-- 'BDF.yue': -> Watchdog.transpile('BDF.yue')
+			-- 'distribute.yue': -> Watchdog.transpile('distribute.yue')
+			'main.lua': -> lume.hotswap('main')
+			'input.lua': -> lume.hotswap('input')
+			'ui.lua': -> lume.hotswap('ui')
+			-- 'color.lua': -> lume.hotswap('color')
+			'utl.lua': -> lume.hotswap('utl')
+			'bigmap.lua': -> lume.hotswap('bigmap')
+			-- 'BDF.lua': -> lume.hotswap('BDF')
+			-- 'distribute.lua': -> lume.hotswap('distribute')
+			}
+	if DEBUGMODE -- build
+		love.thread.newThread([[
+_G.PROJECTNAME, _G.VERSION = ...
+require('distribute').build({'lib/gifcat.lua', 'gifcatlib.so', 'gifcatlib.dll'})
+]])\start(PROJECTNAME, VERSION)
